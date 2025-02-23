@@ -1,0 +1,139 @@
+from flask import Flask
+from threading import Thread
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    server = Thread(target=run)
+    server.start()
+import discord
+from discord.ext import commands
+import asyncio
+
+import os  
+TOKEN = os.getenv("TOKEN")  
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Match Data
+ongoing_matches = {}
+match_history = {}
+cooldowns = {}
+leaderboard = {}
+
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user}')
+
+@bot.command()
+async def lock(ctx, *players: discord.Member):
+    """Locks in players for a match"""
+    if ctx.author in ongoing_matches:
+        await ctx.send("You are already in an ongoing match!")
+        return
+
+    for player in players:
+        if player in ongoing_matches:
+            await ctx.send(f"{player.display_name} is already in an ongoing match!")
+            return
+
+    match_size = len(players) + 1
+    if match_size not in [2, 4, 10]:
+        await ctx.send("Invalid team size! Only 1v1, 2v2, and 5v5 are supported.")
+        return
+
+    match_key = tuple(sorted([ctx.author.id] + [p.id for p in players]))
+    ongoing_matches[match_key] = {"players": [ctx.author] + list(players), "status": "locked"}
+    await ctx.send(f"Match locked in for {', '.join(p.mention for p in [ctx.author] + list(players))}! Use !win @opponent_team to report results.")
+
+@bot.command()
+async def win(ctx, *opponents: discord.Member):
+    """Reports a match win"""
+    match_key = None
+    for key, match in ongoing_matches.items():
+        if ctx.author.id in key:
+            match_key = key
+            break
+
+    if not match_key:
+        await ctx.send("You are not in an ongoing match!")
+        return
+
+    if any(opponent.id not in match_key for opponent in opponents):
+        await ctx.send("Invalid opponents! Make sure you are reporting the correct match.")
+        return
+
+    winner_team = [p for p in ongoing_matches[match_key]["players"] if p not in opponents]
+    loser_team = list(opponents)
+
+    await ctx.send(f"{', '.join(p.mention for p in winner_team)} won against {', '.join(p.mention for p in loser_team)}! Waiting for confirmation...")
+
+    def check(m):
+        return m.author in loser_team and m.content.lower() == "!confirm"
+
+    try:
+        await bot.wait_for("message", check=check, timeout=60)
+        match_history[match_key] = {"winners": winner_team, "losers": loser_team}
+        del ongoing_matches[match_key]
+
+        for player in winner_team:
+            leaderboard[player.id] = leaderboard.get(player.id, 0) + 1
+
+        await ctx.send("Match result confirmed! Scores updated.")
+    except asyncio.TimeoutError:
+        await ctx.send("Confirmation timeout! Match result not recorded.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def override(ctx, winner: discord.Member, loser: discord.Member):
+    """Moderator override to correct match results"""
+    match_key = tuple(sorted([winner.id, loser.id]))
+    match_history[match_key] = {"winners": [winner], "losers": [loser]}
+    leaderboard[winner.id] = leaderboard.get(winner.id, 0) + 1
+    await ctx.send(f"Moderator override applied: {winner.mention} won against {loser.mention}.")
+
+@bot.command()
+async def leaderboard(ctx, category: str = "players"):
+    """Displays the leaderboard for players or teams"""
+    if category == "players":
+        sorted_leaderboard = sorted(leaderboard.items(), key=lambda x: x[1], reverse=True)
+        message = "🏆 **Player Leaderboard:**\n"
+        for i, (player_id, wins) in enumerate(sorted_leaderboard[:10], 1):
+            user = await bot.fetch_user(player_id)
+            message += f"{i}. {user.display_name} - {wins} wins\n"
+    elif category == "teams":
+        team_wins = {}
+        for match in match_history.values():
+            team = tuple(sorted(p.id for p in match["winners"]))
+            team_wins[team] = team_wins.get(team, 0) + 1
+        sorted_teams = sorted(team_wins.items(), key=lambda x: x[1], reverse=True)
+        message = "🏆 **Team Leaderboard:**\n"
+        for i, (team, wins) in enumerate(sorted_teams[:10], 1):
+            team_names = [await bot.fetch_user(pid) for pid in team]
+            team_display = ", ".join(user.display_name for user in team_names)
+            message += f"{i}. {team_display} - {wins} wins\n"
+    else:
+        await ctx.send("Invalid category! Use `players` or `teams`.")
+        return
+
+    await ctx.send(message)
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You don't have permission to use this command!")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Missing required argument!")
+    else:
+        await ctx.send("An error occurred. Please try again.")
+
+keep_alive()  # Start the web server
+bot.run(TOKEN)  # Start the bot
